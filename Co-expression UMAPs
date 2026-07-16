@@ -1,0 +1,350 @@
+import sys
+sys.path.append('/rds/project/rds-O11U8YqSuCk/lam_group/mmw72/py_packages')
+
+import scanpy as sc
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from pathlib import Path
+import numpy as np
+import shutil
+
+adata_path = "v0.6_HypoMap3D_full.h5ad"
+cluster_txt = "mc4r_L4_significant_clusters.txt"
+outdir = Path("mc4r_L4_marker_pair_umaps")
+CLUSTER_COL = "L4"
+MC4R_GENE = "Mc4r"
+USE_RAW = True
+
+USE_REP = "X_embed"
+N_NEIGHBORS = 15          # default; automatically capped at n_obs - 1 for small clusters
+UMAP_MIN_DIST = 0.3       # standard scanpy default
+
+if outdir.exists():
+    print(f"Removing old output directory: {outdir}")
+    shutil.rmtree(outdir)
+outdir.mkdir(exist_ok=True)
+
+cluster_gene_pairs = [
+    ("N4-733 VMH Fezf1 Glut_4-1", "Nmu"),
+    ("N4-227 DMH-LHA Gsx1 GABA_2b-2", "Crh"),
+    ("N4-188 DMH Lef1 GABA_2-1", "Thbs1"),
+    ("N4-346 MPN-MPO-PVpo Hmx2 Eomes Glut_7-4", "Ghrh"),
+    ("N4-744 VMH Nr5a1 Prdm13 Glut_2-2", "Gpr83"),
+    ("N4-344 MPN-MPO-PVpo Hmx2 Eomes Glut_7-2", "Glp1r"),
+    ("N4-728 VMH Fezf1 Glut_3-1", "Qrfpr"),
+    ("N4-731 VMH Fezf1 Glut_3-4", "Mc3r"),
+    ("N4-349 MPN-MPO-PVpo Hmx2 Eomes Glut_7-7", "Ghsr"),
+    ("N4-356 MPN-MPO-PVpo Hmx2 Sox14 Glut_7-7", "Igf1"),
+    ("N4-349 MPN-MPO-PVpo Hmx2 Eomes Glut_7-7", "Ghrh"),
+    ("N4-346 MPN-MPO-PVpo Hmx2 Eomes Glut_7-4", "Tacr3"),
+]
+
+print("Loading AnnData...")
+adata = sc.read_h5ad(adata_path)
+
+with open(cluster_txt) as f:
+    significant_clusters = [line.strip() for line in f if line.strip()]
+
+adata_sub = adata[adata.obs[CLUSTER_COL].astype(str).isin(significant_clusters)].copy()
+
+if USE_REP not in adata_sub.obsm:
+    raise ValueError(
+        f"USE_REP='{USE_REP}' not found in adata.obsm. "
+        f"Available keys: {list(adata_sub.obsm.keys())}"
+    )
+
+print(f"Cells in {len(significant_clusters)} significant clusters: {adata_sub.n_obs}")
+
+print(f"Re-computing neighbours for full 61-cluster subset using '{USE_REP}'...")
+sc.pp.neighbors(adata_sub, use_rep=USE_REP, n_neighbors=N_NEIGHBORS)
+print("Re-computing UMAP for full 61-cluster subset...")
+sc.tl.umap(adata_sub, min_dist=UMAP_MIN_DIST)
+
+
+def get_gene_expr(adata_obj, gene, use_raw=True):
+     if use_raw and adata_obj.raw is not None and gene in adata_obj.raw.var_names:
+        x = adata_obj.raw[:, gene].X
+    elif gene in adata_obj.var_names:
+        x = adata_obj[:, gene].X
+    else:
+        raise ValueError(f"{gene} not found in adata.raw.var_names or adata.var_names")
+    if hasattr(x, "toarray"):
+        x = x.toarray()
+    return np.asarray(x).flatten()
+
+
+def centered_limits(x, y, pad=0.08):
+     xmin, xmax = np.min(x), np.max(x)
+    ymin, ymax = np.min(y), np.max(y)
+    xmid = (xmin + xmax) / 2
+    ymid = (ymin + ymax) / 2
+    half_range = max(xmax - xmin, ymax - ymin) / 2
+    half_range = half_range * (1 + pad)
+    return (
+        xmid - half_range,
+        xmid + half_range,
+        ymid - half_range,
+        ymid + half_range,
+    )
+
+
+def safe_name(x):
+    """Make a string safe to use in a filename."""
+    return (
+        x.replace("/", "-")
+        .replace(" ", "_")
+        .replace("+", "plus")
+        .replace("|", "")
+    )
+
+
+def make_distinct_colors(n):
+     cmaps = [
+        plt.cm.tab20,
+        plt.cm.tab20b,
+        plt.cm.tab20c,
+        plt.cm.Set3,
+        plt.cm.Dark2,
+        plt.cm.Accent,
+    ]
+    colors = []
+    for cmap in cmaps:
+        needed = n - len(colors)
+        if needed <= 0:
+            break
+        steps = min(20, needed)
+        colors.extend(cmap(np.linspace(0, 1, steps)))
+    return colors[:n]
+
+
+def add_cluster_number_labels(ax, x, y, labels, label_to_number):
+      for label, number in label_to_number.items():
+        mask = labels == label
+        if mask.sum() == 0:
+            continue
+        x_med = np.median(x[mask])
+        y_med = np.median(y[mask])
+        ax.text(
+            x_med,
+            y_med,
+            str(number),
+            fontsize=8,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            color="black",
+            bbox=dict(
+                boxstyle="circle,pad=0.2",
+                facecolor="white",
+                edgecolor="black",
+                linewidth=0.5,
+                alpha=0.85,
+            ),
+            zorder=10,
+        )
+
+
+grey = "lightgrey"
+blue = "#9bb7df"
+green = "#a7d3ad"
+red = "#d86b6b"
+
+umap = adata_sub.obsm["X_umap"]
+x = umap[:, 0]
+y = umap[:, 1]
+cluster_labels = adata_sub.obs[CLUSTER_COL].astype(str).values
+
+print("Creating overview UMAP with 12 selected clusters colored and numbered...")
+spreadsheet_clusters = [cluster for cluster, gene in cluster_gene_pairs]
+unique_selected_clusters = list(dict.fromkeys(spreadsheet_clusters))
+selected_number_map = {cluster: i + 1 for i, cluster in enumerate(unique_selected_clusters)}
+
+fig, ax = plt.subplots(figsize=(10, 8))
+ax.scatter(
+    x, y,
+    s=3,
+    c=grey,
+    linewidths=0,
+    alpha=0.75,
+    label="Other significant clusters",
+)
+
+cluster_colors_12 = make_distinct_colors(len(unique_selected_clusters))
+for cluster, color in zip(unique_selected_clusters, cluster_colors_12):
+    mask = cluster_labels == cluster
+    ax.scatter(
+        x[mask],
+        y[mask],
+        s=6,
+        c=[color],
+        linewidths=0,
+        alpha=1,
+        label=f"{selected_number_map[cluster]}. {cluster}",
+    )
+
+add_cluster_number_labels(ax, x, y, cluster_labels, selected_number_map)
+
+ax.set_title("Significant clusters", fontsize=18)
+ax.set_xlabel("UMAP_1")
+ax.set_ylabel("UMAP_2")
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.legend(
+    loc="center left",
+    bbox_to_anchor=(1.02, 0.5),
+    frameon=False,
+    markerscale=3,
+    fontsize=8,
+)
+plt.savefig(
+    outdir / "UMAP_12_selected_clusters_colored.png",
+    dpi=300,
+    bbox_inches="tight",
+)
+plt.close()
+
+print("Creating overview UMAP with all 61 clusters colored...")
+all_clusters = sorted(adata_sub.obs[CLUSTER_COL].astype(str).unique())
+cluster_colors_61 = make_distinct_colors(len(all_clusters))
+
+fig, ax = plt.subplots(figsize=(14, 9))
+for cluster, color in zip(all_clusters, cluster_colors_61):
+    mask = cluster_labels == cluster
+    ax.scatter(
+        x[mask],
+        y[mask],
+        s=4,
+        c=[color],
+        linewidths=0,
+        alpha=0.9,
+        label=cluster,
+    )
+
+ax.set_title("All 61 significant clusters", fontsize=18)
+ax.set_xlabel("UMAP_1")
+ax.set_ylabel("UMAP_2")
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.legend(
+    loc="center left",
+    bbox_to_anchor=(1.02, 0.5),
+    frameon=False,
+    markerscale=3,
+    fontsize=5.5,
+    ncol=1,
+)
+plt.savefig(
+    outdir / "UMAP_all_61_significant_clusters_colored.png",
+    dpi=300,
+    bbox_inches="tight",
+)
+plt.close()
+
+print("Creating 12 single-cluster coexpression UMAPs (re-embedded)...")
+for i, (cluster, marker_gene) in enumerate(cluster_gene_pairs, start=1):
+    print(f"\nPlotting {i}: {cluster} | Mc4r + {marker_gene}")
+
+    adata_cluster = adata_sub[adata_sub.obs[CLUSTER_COL].astype(str) == cluster].copy()
+    if adata_cluster.n_obs == 0:
+        print(f"WARNING: no cells found for {cluster}, skipping")
+        continue
+
+        n_neighbors_actual = min(N_NEIGHBORS, adata_cluster.n_obs - 1)
+    if n_neighbors_actual < 2:
+        print(f"WARNING: cluster '{cluster}' has only {adata_cluster.n_obs} cells — too few to re-embed, skipping")
+        continue
+
+    print(f"  Re-computing neighbours (n_neighbors={n_neighbors_actual}) using '{USE_REP}'...")
+    sc.pp.neighbors(adata_cluster, use_rep=USE_REP, n_neighbors=n_neighbors_actual)
+    print("  Re-computing UMAP...")
+    sc.tl.umap(adata_cluster, min_dist=UMAP_MIN_DIST)
+
+    umap_cluster = adata_cluster.obsm["X_umap"]
+    x_cluster = umap_cluster[:, 0]
+    y_cluster = umap_cluster[:, 1]
+
+    mc4r_expr = get_gene_expr(adata_cluster, MC4R_GENE, use_raw=USE_RAW)
+    marker_expr = get_gene_expr(adata_cluster, marker_gene, use_raw=USE_RAW)
+
+    mc4r_pos = mc4r_expr > 0
+    marker_pos = marker_expr > 0
+    both_neg = ~mc4r_pos & ~marker_pos
+    mc4r_only = mc4r_pos & ~marker_pos
+    marker_only = ~mc4r_pos & marker_pos
+    both_pos = mc4r_pos & marker_pos
+
+    n_both_neg = int(both_neg.sum())
+    n_mc4r_only = int(mc4r_only.sum())
+    n_marker_only = int(marker_only.sum())
+    n_both_pos = int(both_pos.sum())
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(
+        x_cluster[both_neg],
+        y_cluster[both_neg],
+        s=8,
+        c=grey,
+        linewidths=0,
+        alpha=0.7,
+        label=f"Mc4r− / marker− (n={n_both_neg})",
+        zorder=1,
+    )
+    ax.scatter(
+        x_cluster[mc4r_only],
+        y_cluster[mc4r_only],
+        s=10,
+        c=blue,
+        linewidths=0,
+        alpha=0.9,
+        label=f"Mc4r+ only (n={n_mc4r_only})",
+        zorder=2,
+    )
+    ax.scatter(
+        x_cluster[marker_only],
+        y_cluster[marker_only],
+        s=10,
+        c=green,
+        linewidths=0,
+        alpha=0.9,
+        label=f"marker+ only (n={n_marker_only})",
+        zorder=3,
+    )
+    ax.scatter(
+        x_cluster[both_pos],
+        y_cluster[both_pos],
+        s=14,
+        c=red,
+        linewidths=0,
+        alpha=1,
+        label=f"Mc4r+ + marker+ (n={n_both_pos})",
+        zorder=4,
+    )
+
+    xmin, xmax, ymin, ymax = centered_limits(x_cluster, y_cluster)
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_title(f"{cluster}\nMc4r + {marker_gene}", fontsize=11)
+    ax.set_xlabel("UMAP_1")
+    ax.set_ylabel("UMAP_2")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    legend_elements = [
+        Line2D([0], [0], marker="o", color="w", label=f"Mc4r− / marker− (n={n_both_neg})",
+               markerfacecolor=grey, markersize=8),
+        Line2D([0], [0], marker="o", color="w", label=f"Mc4r+ only (n={n_mc4r_only})",
+               markerfacecolor=blue, markersize=8),
+        Line2D([0], [0], marker="o", color="w", label=f"marker+ only (n={n_marker_only})",
+               markerfacecolor=green, markersize=8),
+        Line2D([0], [0], marker="o", color="w", label=f"Mc4r+ + marker+ (n={n_both_pos})",
+               markerfacecolor=red, markersize=8),
+    ]
+    ax.legend(handles=legend_elements, loc="best", frameon=False, fontsize=9)
+
+    outfile = outdir / f"{i:02d}_{safe_name(cluster)}_Mc4r_{safe_name(marker_gene)}_coexpression.png"
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {outfile}")
+
+print("\nDONE")
+print(f"Files saved to: {outdir}")
