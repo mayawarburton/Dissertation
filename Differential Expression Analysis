@@ -1,0 +1,123 @@
+import os
+import numpy as np
+import pandas as pd
+import scanpy as sc
+
+INPUT_H5AD = "v0.6_HypoMap3D_full.h5ad"
+CLUSTER_LIST = "mc4r_L4_significant_clusters.txt"   # one L4 cluster name per line
+GROUP_COL = "L4"
+SAVE_DIR = "mc4r_L4_61_cluster_wilcoxon"
+CHECKS_DIR = "checks"
+SUBSET_H5AD_NAME = "mc4r_L4_61_cluster_subset.h5ad"
+FULL_TABLE_NAME = "mc4r_L4_61_markers_specificity_pct_full.csv"
+TOP_TABLE_NAME = "mc4r_L4_61_markers_specificity_pct_top5.csv"
+
+MAX_PADJ = 0.05   # BH-adjusted p-value threshold for a "significant" marker
+TOP_K = 5         # how many top-ranked genes to keep per cluster in the shortlist
+
+
+def read_cluster_names(path):
+    with open(path) as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+def main():
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(CHECKS_DIR, exist_ok=True)
+
+    # load data and subset to the Mc4r-enriched clusters
+    print("Reading full dataset...")
+    adata = sc.read_h5ad(INPUT_H5AD)
+
+    if GROUP_COL not in adata.obs.columns:
+        raise RuntimeError(f"{GROUP_COL} not found in adata.obs")
+
+    wanted_clusters = read_cluster_names(CLUSTER_LIST)
+    print(f"Loaded {len(wanted_clusters)} clusters")
+
+    adata.obs[GROUP_COL] = adata.obs[GROUP_COL].astype(str)
+    adata = adata[adata.obs[GROUP_COL].isin(wanted_clusters)].copy()
+
+    if adata.n_obs == 0:
+        raise RuntimeError("No cells remaining after filtering.")
+
+    print(f"Subset contains {adata.n_obs} cells across {adata.obs[GROUP_COL].nunique()} clusters")
+
+    subset_path = os.path.join(CHECKS_DIR, SUBSET_H5AD_NAME)
+    adata.write_h5ad(subset_path)
+    print(f"Saved subset h5ad: {subset_path}")
+
+    # normalise and run the Wilcoxon test 
+        print("Normalising subset...")
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    print("Running Wilcoxon test on subset...")
+    sc.tl.rank_genes_groups(
+        adata,
+        groupby=GROUP_COL,
+        method="wilcoxon",
+        corr_method="benjamini-hochberg",   # BH FDR correction, as per methods
+        use_raw=False,
+        pts=True,
+    )
+
+    markers = sc.get.rank_genes_groups_df(adata, group=None).copy()
+    markers["gene_name"] = markers["names"].astype(str)
+
+    required_cols = {"group", "names", "logfoldchanges", "pvals_adj"}
+    missing = required_cols - set(markers.columns)
+    if missing:
+        raise RuntimeError(f"Missing expected columns: {missing}")
+
+        pct_group_col = next((c for c in ["pct_nz_group", "pts"] if c in markers.columns), None)
+    pct_ref_col = next((c for c in ["pct_nz_reference", "pts_rest"] if c in markers.columns), None)
+    if pct_group_col is None or pct_ref_col is None:
+        raise RuntimeError("Percent-expression columns not found.")
+
+       markers = markers[markers["pvals_adj"] < MAX_PADJ].copy()
+    if markers.empty:
+        raise RuntimeError("No markers passed filtering.")
+
+    # specificity score: SP = (|pctA - pctB| / (pctA + pctB)) * |log2FC|
+    pctA = markers[pct_group_col].astype(float)   # proportion expressing in the cluster
+    pctB = markers[pct_ref_col].astype(float)     # proportion expressing in the reference population
+    log2fc = markers["logfoldchanges"].astype(float)
+
+    denom = pctA + pctB
+    markers["specificity_score"] = np.where(
+        denom > 0,
+        (np.abs(pctA - pctB) / denom) * np.abs(log2fc),
+        0.0,
+    )
+
+    out = markers.sort_values(
+        by=["group", "specificity_score"],
+        ascending=[True, False],
+    ).copy()
+    out["L4"] = out["group"]
+    out["p_value"] = out["pvals_adj"]
+
+    full_table = out[[
+        "L4",
+        "gene_name",
+        "p_value",
+        "specificity_score",
+        "logfoldchanges",
+        pct_group_col,
+        pct_ref_col,
+    ]].copy()
+
+    top_table = full_table.groupby("L4", group_keys=False).head(TOP_K).copy()
+
+    full_path = os.path.join(SAVE_DIR, FULL_TABLE_NAME)
+    top_path = os.path.join(SAVE_DIR, TOP_TABLE_NAME)
+    full_table.to_csv(full_path, index=False)
+    top_table.to_csv(top_path, index=False)
+
+    print(f"Saved full table: {full_path}")
+    print(f"Saved top5 table: {top_path}")
+
+
+if __name__ == "__main__":
+    main()
