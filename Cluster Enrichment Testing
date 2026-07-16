@@ -1,0 +1,136 @@
+import os
+import numpy as np
+import pandas as pd
+import anndata as ad
+from scipy import sparse
+from scipy.stats import chi2_contingency
+from statsmodels.stats.multitest import multipletests
+
+INFILE = "v0.6_HypoMap3D_full.h5ad"
+GENE = "Mc4r"
+L3_COL = "L3"
+L4_COL = "L4"
+OUTDIR = "mc4r_L4_fisher_filtered"
+
+COUNT_THR = 1           # a cell counts as "positive" if its raw count is > 1
+MIN_CELLS_TOTAL = 20    # cluster must have at least this many cells
+MIN_POS_CELLS = 20      # cluster must have at least this many positive cells
+
+# statistical filters, applied to the chi-squared results (after FDR correction)
+P_THR = 0.05            # threshold applied to the FDR-corrected p-value (q-value)
+OR_THR = 2.0            # odds ratio must be at least this big
+FDR_METHOD = "fdr_bh"   # Benjamini-Hochberg
+
+os.makedirs(OUTDIR, exist_ok=True)
+
+adata = ad.read_h5ad(INFILE, backed="r")
+
+if L3_COL not in adata.obs.columns:
+    raise RuntimeError(f"{L3_COL} not found in adata.obs")
+if L4_COL not in adata.obs.columns:
+    raise RuntimeError(f"{L4_COL} not found in adata.obs")
+if GENE not in adata.var_names:
+    hits = [g for g in adata.var_names if "mc4r" in str(g).lower()]
+    raise RuntimeError(f"{GENE} not found. Matches: {hits[:20]}")
+
+gene_data = adata[:, [GENE]].layers["counts"] if "counts" in adata.layers else adata[:, [GENE]].X
+mc4r_counts = np.asarray(gene_data.toarray()).ravel() if sparse.issparse(gene_data) else np.asarray(gene_data).ravel()
+
+l3_labels = adata.obs[L3_COL].astype(str).to_numpy()
+l4_labels = adata.obs[L4_COL].astype(str).to_numpy()
+mc4r_pos = mc4r_counts > COUNT_THR
+
+df = pd.DataFrame({
+    "L3": l3_labels,
+    "L4": l4_labels,
+    "mc4r_counts": mc4r_counts,
+    "mc4r_pos": mc4r_pos,
+})
+
+cluster_summary = (
+    df.groupby(["L3", "L4"], observed=True)
+      .agg(
+          n_cells=("L4", "size"),
+          n_pos=("mc4r_pos", "sum"),
+          mean_count=("mc4r_counts", "mean"),
+          median_count=("mc4r_counts", "median"),
+      )
+      .reset_index()
+)
+cluster_summary["n_pos"] = cluster_summary["n_pos"].astype(int)
+cluster_summary["frac_pos"] = cluster_summary["n_pos"] / cluster_summary["n_cells"]
+
+prefiltered = cluster_summary[
+    (cluster_summary["n_cells"] >= MIN_CELLS_TOTAL) &
+    (cluster_summary["n_pos"] >= MIN_POS_CELLS)
+].copy()
+kept_clusters = prefiltered[["L3", "L4"]].values.tolist()
+
+print(f"Clusters before filter: {cluster_summary.shape[0]}")
+print(f"Clusters after prefilter: {len(kept_clusters)}")
+
+# totals across the whole dataset, needed for the "outside this cluster" side of each table
+total_pos = int(df["mc4r_pos"].sum())
+total_cells = int(df.shape[0])
+total_neg = total_cells - total_pos
+
+# chi-squared test per cluster
+rows = []
+for l3_name, l4_name in kept_clusters:
+    sub = df[(df["L3"] == l3_name) & (df["L4"] == l4_name)]
+
+    n_cells = int(sub.shape[0])
+    n_pos = int(sub["mc4r_pos"].sum())
+    n_neg = n_cells - n_pos
+
+    # everything outside this cluster
+    pos_out = total_pos - n_pos
+    neg_out = total_neg - n_neg
+
+    table = np.array([
+        [n_pos, n_neg],
+        [pos_out, neg_out],
+    ])
+    chi2, p_value, dof, expected = chi2_contingency(table)
+
+    denom = n_neg * pos_out
+    odds_ratio = np.inf if denom == 0 else (n_pos * neg_out) / denom
+
+    rows.append({
+        "L3": l3_name,
+        "L4": l4_name,
+        "n_cells": n_cells,
+        "raw_count_cells_gt1": n_pos,
+        "frac_pos": n_pos / n_cells,
+        "mean_count": float(sub["mc4r_counts"].mean()),
+        "median_count": float(sub["mc4r_counts"].median()),
+        "odds_ratio": odds_ratio,
+        "p_value": p_value,
+    })
+
+results = pd.DataFrame(rows)
+
+results = results.sort_values(["L3", "L4"], ascending=[True, True])
+
+all_csv = os.path.join(OUTDIR, "mc4r_L4_all_prefiltered_chi2.csv")
+results.to_csv(all_csv, index=False)
+
+significant = results[
+    (results["q_value"] < P_THR) &
+    (results["odds_ratio"] >= OR_THR)
+].copy()
+significant = significant.sort_values(["L3", "L4"], ascending=[True, True])
+
+sig_csv = os.path.join(OUTDIR, "mc4r_L4_significant_q0.05_or2_chi2.csv")
+significant.to_csv(sig_csv, index=False)
+
+txt_file = os.path.join(OUTDIR, "mc4r_L4_significant_clusters_chi2.txt")
+with open(txt_file, "w") as f:
+    for _, row in significant[["L3", "L4"]].iterrows():
+        f.write(f"{row['L3']}\t{row['L4']}\n")
+
+print("\nSaved:")
+print(f"- All filtered clusters: {all_csv}")
+print(f"- Significant clusters: {sig_csv}")
+print(f"- Cluster list: {txt_file}")
+print(f"\nFinal significant clusters: {significant.shape[0]}")
