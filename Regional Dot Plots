@@ -1,0 +1,282 @@
+import os
+import re
+import scanpy as sc
+import pandas as pd
+
+INPUT_H5AD = "MC4R_reclustered.h5ad"
+MARKERS_CSV = "mc4r_L4_wilcoxon/mc4r_L4_markers_specificity_with_GO.csv"
+CLUSTER_LIST = "mc4r_L4_significant_clusters.txt"
+GROUP_COL = "L4"
+PLOT_LABEL_COL = "L4_short"
+OUT_DIR = "mc4r_L4_region_dotplots"
+
+DPI = 300
+FIG_WIDTH = 10
+BASE_HEIGHT = 4.2
+HEIGHT_PER_GENE = 0.11
+HEIGHT_PER_CLUSTER = 0.30
+
+TOP_N = 5                     # top marker genes per cluster, by specificity score
+MIN_PCT_NZ_GROUP = 0.2        # drop genes expressed in too few cells within their group
+MAX_GENES_PER_REGION = 30     # cap on genes shown per region plot
+
+REGION_ORDER = [
+    "VMH", "DMH", "PVH", "ARH", "AHN", "SCH",
+    "MPO_MPN", "PMv_TMv", "STN_PSTN", "Other",
+]
+
+
+def read_cluster_names(path):
+    with open(path) as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+def infer_region_from_l4(label):
+    parts = str(label).split()
+    if len(parts) > 1:
+        return parts[1]
+    return "UNKNOWN"
+
+
+def map_region_group(region):
+     if region == "VMH":
+        return "VMH"
+    if region == "DMH":
+        return "DMH"
+    if region.startswith("PVH"):
+        return "PVH"
+    if region.startswith("ARH"):
+        return "ARH"
+    if region == "AHN":
+        return "AHN"
+    if region == "SCH":
+        return "SCH"
+    if any(x in region for x in ["MPO", "MPN", "PVpo", "VMPO", "LPO", "BST"]):
+        return "MPO_MPN"
+    if region in ["PMv-TMv", "PMv", "TMv"]:
+        return "PMv_TMv"
+    if region == "STN-PSTN":
+        return "STN_PSTN"
+    return "Other"
+
+
+def extract_n_number(label):
+      label = str(label)
+    m = re.search(r"\bN(\d+)", label)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)", label)
+    if m:
+        return int(m.group(1))
+    return float("inf")
+
+
+def extract_n4_id(label):
+      label = str(label)
+    m = re.search(r"\bN\d+(?:-\d+)?\b", label)
+    if m:
+        return m.group(0)
+    return label
+
+
+def sort_clusters_by_n(clusters):
+    return sorted(clusters, key=lambda x: (extract_n_number(x), str(x)))
+
+
+def keep_protein_coding(markers):
+    if "Gene type" not in markers.columns:
+        raise ValueError("Column 'Gene type' not found in marker CSV.")
+    gene_type = markers["Gene type"].astype(str).str.strip().str.lower()
+    keep = gene_type.isin(["protein_coding", "protein-coding", "protein coding"])
+    markers = markers[keep].copy()
+    if markers.empty:
+        raise ValueError("No protein-coding genes remain after filtering Gene type.")
+    return markers
+
+
+def keep_informative_markers(markers, min_pct_nz_group=0.2):
+    if "pct_nz_group" not in markers.columns:
+        return markers.copy()
+    markers = markers.copy()
+    markers["pct_nz_group"] = pd.to_numeric(markers["pct_nz_group"], errors="coerce")
+    markers = markers.dropna(subset=["pct_nz_group"])
+    markers = markers[markers["pct_nz_group"] > min_pct_nz_group].copy()
+    if markers.empty:
+        raise ValueError(f"No markers remain after filtering pct_nz_group > {min_pct_nz_group}.")
+    return markers
+
+
+def keep_top_n_by_specificity(markers, n=5):
+    if "specificity_score" not in markers.columns:
+        raise ValueError("Column 'specificity_score' not found in marker CSV.")
+    markers = markers.copy()
+    markers["specificity_score"] = pd.to_numeric(markers["specificity_score"], errors="coerce")
+    markers = markers.dropna(subset=["specificity_score"])
+    markers = (
+        markers.sort_values([GROUP_COL, "specificity_score"], ascending=[True, False])
+               .groupby(GROUP_COL, group_keys=False)
+               .head(n)
+               .copy()
+    )
+    if markers.empty:
+        raise ValueError("No markers remain after selecting top genes by specificity_score.")
+    return markers
+
+
+def build_gene_list(markers, cluster_order):
+       ordered_genes = []
+    seen = set()
+    for cl in cluster_order:
+        sub = markers[markers[GROUP_COL].astype(str) == str(cl)].copy()
+        sub = sub.sort_values("specificity_score", ascending=False)
+        for gene in sub["gene_name"].astype(str):
+            if gene not in seen:
+                ordered_genes.append(gene)
+                seen.add(gene)
+    return ordered_genes
+
+
+def reposition_legends_below(dp):
+        if hasattr(dp, "make_figure"):
+        dp.make_figure()
+
+    fig = getattr(dp, "fig", None)
+    if fig is None:
+        return None
+
+    axes_dict = dp.get_axes()
+    main_ax = axes_dict.get("mainplot_ax", None)
+    size_ax = axes_dict.get("size_legend_ax", None)
+    color_ax = axes_dict.get("color_legend_ax", None)
+    if main_ax is None or size_ax is None or color_ax is None:
+        return fig
+
+    _, fig_h = fig.get_size_inches()
+
+        reserve_bottom_in = 2.15
+    bottom = max(0.36, reserve_bottom_in / fig_h)
+    fig.subplots_adjust(left=0.06, right=0.99, bottom=bottom, top=0.98)
+    main_ax.margins(x=0.01)
+
+      main_left = 0.06
+    main_width = 0.93
+    main_bottom = bottom + 0.10
+    main_top = 0.98
+    main_height = max(0.22, main_top - main_bottom)
+    main_ax.set_position([main_left, main_bottom, main_width, main_height])
+    main_pos = main_ax.get_position()
+
+    # put legends in the reserved bottom band, clearly below the x labels
+    legend_h = min(0.09, 0.42 / fig_h)
+    legend_y = 0.05
+    gap = 0.10 * main_pos.width
+    size_w = 0.18 * main_pos.width
+    color_w = 0.24 * main_pos.width
+    total_w = size_w + gap + color_w
+    start_x = main_pos.x0 + (main_pos.width - total_w) / 2
+
+    size_ax.set_position([start_x, legend_y, size_w, legend_h])
+    color_ax.set_position([start_x + size_w + gap, legend_y, color_w, legend_h])
+    size_ax.set_title("Fraction of cells\nin group (%)", pad=18)
+    color_ax.set_title("Mean expression\nin group", pad=18)
+    color_ax.xaxis.set_ticks_position("bottom")
+    color_ax.xaxis.set_label_position("bottom")
+
+    # keep legend axes above anything else visually
+    size_ax.set_zorder(10)
+    color_ax.set_zorder(10)
+    size_ax.patch.set_alpha(0)
+    color_ax.patch.set_alpha(0)
+
+    return fig
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+       adata = sc.read_h5ad(INPUT_H5AD).copy()
+    adata.obs[GROUP_COL] = adata.obs[GROUP_COL].astype(str)
+
+    wanted_clusters = read_cluster_names(CLUSTER_LIST)
+    adata = adata[adata.obs[GROUP_COL].isin(wanted_clusters)].copy()
+
+     markers = pd.read_csv(MARKERS_CSV)
+    markers[GROUP_COL] = markers[GROUP_COL].astype(str)
+
+    required_cols = [GROUP_COL, "gene_name", "specificity_score", "Gene type"]
+    missing = [c for c in required_cols if c not in markers.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in marker CSV: {missing}")
+
+    markers = markers[markers[GROUP_COL].isin(wanted_clusters)].copy()
+    markers = keep_protein_coding(markers)
+    markers = keep_informative_markers(markers, min_pct_nz_group=MIN_PCT_NZ_GROUP)
+    markers = markers[markers["gene_name"].astype(str).isin(set(adata.var_names.astype(str)))].copy()
+    markers = keep_top_n_by_specificity(markers, n=TOP_N)
+
+        adata.obs["raw_region"] = adata.obs[GROUP_COL].astype(str).map(infer_region_from_l4)
+    adata.obs["region_group"] = adata.obs["raw_region"].map(map_region_group)
+    adata.obs[PLOT_LABEL_COL] = adata.obs[GROUP_COL].astype(str).map(extract_n4_id)
+
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+        print("Making plots for regions present in the data...")
+    for region in REGION_ORDER:
+        region_adata = adata[adata.obs["region_group"] == region].copy()
+        if region_adata.n_obs == 0:
+            continue
+
+        region_clusters = list(region_adata.obs[GROUP_COL].unique())
+        region_cluster_order = sort_clusters_by_n(region_clusters)
+
+        region_markers = markers[markers[GROUP_COL].isin(region_cluster_order)].copy()
+        if region_markers.empty:
+            print(f"Skipping {region}: no markers after filtering.")
+            continue
+
+        ordered_genes = build_gene_list(region_markers, region_cluster_order)
+        ordered_genes = ordered_genes[:MAX_GENES_PER_REGION]
+        ordered_genes = [g for g in ordered_genes if g in region_adata.var_names]
+        if not ordered_genes:
+            print(f"Skipping {region}: no valid genes to plot.")
+            continue
+
+        short_label_order = [extract_n4_id(c) for c in region_cluster_order]
+        region_adata.obs[PLOT_LABEL_COL] = pd.Categorical(
+            region_adata.obs[PLOT_LABEL_COL],
+            categories=short_label_order,
+            ordered=True,
+        )
+
+        fig_height = max(
+            BASE_HEIGHT,
+            HEIGHT_PER_GENE * len(ordered_genes) + HEIGHT_PER_CLUSTER * len(region_cluster_order),
+        )
+
+        dp = sc.pl.dotplot(
+            region_adata,
+            var_names=ordered_genes,
+            groupby=PLOT_LABEL_COL,
+            use_raw=False,
+            standard_scale="var",
+            show=False,
+            return_fig=True,
+            figsize=(FIG_WIDTH, fig_height),
+            cmap="Reds",
+            dot_min=0.03,
+            dot_max=0.45,
+        )
+
+        fig = reposition_legends_below(dp)
+
+        out_file = os.path.join(OUT_DIR, f"mc4r_L4_{region}_dotplot.png")
+        if fig is not None:
+            fig.savefig(out_file, dpi=DPI, bbox_inches="tight")
+        else:
+            dp.savefig(out_file, dpi=DPI, bbox_inches="tight")
+        print(f"Saved: {out_file}")
+
+
+if __name__ == "__main__":
+    main()
