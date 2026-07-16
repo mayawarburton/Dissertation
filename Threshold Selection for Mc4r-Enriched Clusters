@@ -1,0 +1,69 @@
+import os
+import numpy as np
+import pandas as pd
+import anndata as ad
+from scipy import sparse
+
+INFILE = "MC4R_reclustered.h5ad"
+OUTDIR = "L4_mc4r_filtered"
+GENE = "Mc4r"
+L4_COL = "L4"       # column in adata.obs holding the L4 cluster labels
+COUNT_THR = 1       # a cell counts as "positive" if its raw count is > 1
+MIN_CELLS = 20      # only keep clusters with at least 20 positive cells
+
+os.makedirs(OUTDIR, exist_ok=True)
+
+adata = ad.read_h5ad(INFILE, backed="r")
+
+# pull out Mc4r counts for every cell
+gene_data = adata[:, [GENE]].layers["counts"] if "counts" in adata.layers else adata[:, [GENE]].X
+mc4r_counts = np.asarray(gene_data.toarray()).ravel() if sparse.issparse(gene_data) else np.asarray(gene_data).ravel()
+
+cluster_labels = adata.obs[L4_COL].astype(str).to_numpy()
+
+df = pd.DataFrame({
+    "L4": cluster_labels,
+    "mc4r_counts": mc4r_counts,
+})
+
+# total cells in each cluster, regardless of Mc4r expression
+cluster_sizes = (
+    df.groupby("L4", observed=True)
+      .size()
+      .rename("n_cells")
+      .reset_index()
+)
+
+# restrict to cells that clear the count threshold, then summarise per cluster
+positive_cells = df[df["mc4r_counts"] > COUNT_THR].copy()
+
+cluster_stats = (
+    positive_cells.groupby("L4", observed=True)
+                  .agg(
+                      n_pos=("mc4r_counts", "size"),
+                      mean_count=("mc4r_counts", "mean"),
+                      median_count=("mc4r_counts", "median"),
+                  )
+                  .reset_index()
+)
+
+# combine cluster size with the positive-cell stats
+results = cluster_stats.merge(cluster_sizes, on="L4", how="left")
+results["frac_pos"] = results["n_pos"] / results["n_cells"]
+
+# drop clusters that don't have enough positive cells to be meaningful
+results = results[results["n_pos"] >= MIN_CELLS].copy()
+results = results[["L4", "n_cells", "frac_pos", "mean_count", "median_count"]]
+results = results.sort_values(["n_cells", "frac_pos"], ascending=[False, False])
+
+csv_file = os.path.join(OUTDIR, "L4_mc4r_thr1_min20.csv")
+txt_file = os.path.join(OUTDIR, "L4_mc4r_thr1_min20_clusters.txt")
+
+results.to_csv(csv_file, index=False)
+with open(txt_file, "w") as f:
+    for cluster in results["L4"]:
+        f.write(f"{cluster}\n")
+
+print(f"Saved CSV: {csv_file}")
+print(f"Saved TXT: {txt_file}")
+print(f"Kept {results.shape[0]} L4 clusters")
