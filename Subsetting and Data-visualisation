@@ -1,0 +1,133 @@
+import os
+os.environ["NUMBA_CACHE_DIR"] = "/tmp/numba_cache"
+os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import matplotlib.pyplot as plt
+
+RECLUSTERED_DATA = "MC4R_reclustered.h5ad"
+OUTDIR = "significant_umaps"
+L4_COL = "L4"
+LEGEND_FONTSIZE = 5   # small, since there are 61 groups in the legend
+
+os.makedirs(OUTDIR, exist_ok=True)
+
+# the 61 significant L4 clusters (odds-ratio / statistically significant)
+SIG_L4_CLUSTERS = [
+    "N4-48 AHN-RCH-LHA Otp Fezf1 Glut_8-5",
+    "N4-423 PH-ant-LHA Otp Bsx Glut_5a-3",
+    "N4-424 PH-ant-LHA Otp Bsx Glut_5a-4",
+    "N4-454 PMv-TMv Pitx2 Glut_4-3",
+    "N4-455 PMv-TMv Pitx2 Glut_4-4",
+    "N4-457 PMv-TMv Pitx2 Glut_5-2",
+    "N4-465 PVH-SO-PVa Otp Agtr1a Glut_3a-1",
+    "N4-468 PVH-SO-PVa Otp Agtr1a Glut_5-1",
+    "N4-471 PVH-SO-PVa Otp Agtr1a Glut_6-1",
+    "N4-481 PVH-SO-PVa Otp Nkx2-2 Glut_1-4",
+    "N4-482 PVH-SO-PVa Otp Nkx2-2 Glut_2-1",
+    "N4-529 PVR Six3 Sox3 GABA_12-4",
+    "N4-546 PVpo-VMPO-MPN Hmx2 Esr1 GABA_2-7",
+    "N4-548 PVpo-VMPO-MPN Hmx2 Esr1 GABA_6-10",
+    "N4-552 PVpo-VMPO-MPN Hmx2 Esr1 GABA_6-5",
+    "N4-560 PVpo-VMPO-MPN Hmx2 Isl1 GABA_1a-4",
+    "N4-563 PVpo-VMPO-MPN Hmx2 Isl1 GABA_1a-7",
+    "N4-564 PVpo-VMPO-MPN Hmx2 Isl1 GABA_1a-8",
+    "N4-569 PVpo-VMPO-MPN Hmx2 Isl1 GABA_1c-1",
+    "N4-603 SCH Grp GABA_2-2",
+    "N4-605 SCH Grp GABA_2-4",
+    "N4-652 SI-MPO-LPO Lhx8 GABA_2-1",
+    "N4-653 SI-MPO-LPO Lhx8 GABA_2-2",
+    "N4-662 SI-MPO-LPO Lhx8 GABA_7-1",
+    "N4-672 STN-PSTN Pitx2 Rxfp1 Glut_1-1",
+    "N4-78 ARH-PVp Tbx3 GABA_1-1",
+    "N4-79 ARH-PVp Tbx3 GABA_1-2",
+    "N4-718 VMH Fezf1 Glut_1-1",
+    "N4-721 VMH Fezf1 Glut_1-4",
+    "N4-722 VMH Fezf1 Glut_1-5",
+    "N4-724 VMH Fezf1 Glut_1-7",
+    "N4-727 VMH Fezf1 Glut_2-3",
+    "N4-728 VMH Fezf1 Glut_3-1",
+    "N4-730 VMH Fezf1 Glut_3-3",
+    "N4-731 VMH Fezf1 Glut_3-4",
+    "N4-733 VMH Fezf1 Glut_4-1",
+    "N4-736 VMH Fezf1 Glut_5-1",
+    "N4-738 VMH Fezf1 Glut_5-3",
+    "N4-743 VMH Nr5a1 Prdm13 Glut_2-1",
+    "N4-744 VMH Nr5a1 Prdm13 Glut_2-2",
+    "N4-746 VMH Nr5a1 Prdm13 Glut_2-4",
+    "N4-747 VMH Nr5a1 Sox5 Glut_2-1",
+    "N4-88 ARH-PVp Tbx3 Lef1 Glut_1-2",
+    "N4-136 BST-MPN Six3 Nrgn GABA_8-1",
+    "N4-10 AHN Onecut3 GABA_1-1",
+    "N4-12 AHN Onecut3 GABA_1-3",
+    "N4-168 DMH Hmx2 Mc4r GABA_4-1",
+    "N4-170 DMH Hmx2 Mc4r GABA_4-3",
+    "N4-171 DMH Hmx2 Mc4r GABA_6-1",
+    "N4-188 DMH Lef1 GABA_2-1",
+    "N4-227 DMH-LHA Gsx1 GABA_2b-2",
+    "N4-291 MEA-BST St18 GABA_2-2",
+    "N4-343 MPN-MPO-PVpo Hmx2 Eomes Glut_7-1",
+    "N4-344 MPN-MPO-PVpo Hmx2 Eomes Glut_7-2",
+    "N4-346 MPN-MPO-PVpo Hmx2 Eomes Glut_7-4",
+    "N4-349 MPN-MPO-PVpo Hmx2 Eomes Glut_7-7",
+    "N4-350 MPN-MPO-PVpo Hmx2 Sox14 Glut_7-1",
+    "N4-353 MPN-MPO-PVpo Hmx2 Sox14 Glut_7-4",
+    "N4-354 MPN-MPO-PVpo Hmx2 Sox14 Glut_7-5",
+    "N4-355 MPN-MPO-PVpo Hmx2 Sox14 Glut_7-6",
+    "N4-356 MPN-MPO-PVpo Hmx2 Sox14 Glut_7-7",
+]
+assert len(SIG_L4_CLUSTERS) == 61, f"expected 61 clusters, got {len(SIG_L4_CLUSTERS)}"
+
+
+def plot_significant_umap(adata, cluster_col, targets, fname, legend_fontsize=5):
+    """Plot a UMAP with `targets` colored individually and everything else gray."""
+    plot_col = f"{cluster_col}_significant"
+    adata.obs[plot_col] = np.where(
+        adata.obs[cluster_col].astype(str).isin(targets),
+        adata.obs[cluster_col].astype(str),
+        "Other",
+    )
+    adata.obs[plot_col] = pd.Categorical(
+        adata.obs[plot_col],
+        categories=["Other"] + targets,  # "Other" first so it plots underneath, gray
+        ordered=True,
+    )
+
+    # one distinct color per target cluster, gray for everything else
+    palette = ["#D3D3D3"] + sc.pl.palettes.default_102[:len(targets)]
+
+    sc.pl.umap(
+        adata,
+        color=plot_col,
+        groups=["Other"] + targets,
+        palette=palette,
+        legend_loc="right margin",
+        legend_fontsize=legend_fontsize,
+        frameon=False,
+        show=False,
+    )
+    plt.savefig(os.path.join(OUTDIR, fname), dpi=300, bbox_inches="tight")
+    plt.close()
+
+EMBED_REP = "X_embed"
+
+adata_re = sc.read_h5ad(RECLUSTERED_DATA)
+if "X_umap" not in adata_re.obsm:
+    if EMBED_REP not in adata_re.obsm:
+        raise RuntimeError(f"{EMBED_REP} not found in adata.obsm; can't compute neighbours on it")
+    sc.pp.neighbors(adata_re, use_rep=EMBED_REP)
+    sc.tl.umap(adata_re)
+
+present = set(adata_re.obs[L4_COL].astype(str))
+missing = [c for c in SIG_L4_CLUSTERS if c not in present]
+if missing:
+    print(f"WARNING: {len(missing)} of {len(SIG_L4_CLUSTERS)} target clusters were NOT found in adata.obs['{L4_COL}']:")
+    for m in missing:
+        print("  -", m)
+else:
+    print(f"All {len(SIG_L4_CLUSTERS)} target clusters found in adata.obs['{L4_COL}'].")
+
+plot_significant_umap(adata_re, L4_COL, SIG_L4_CLUSTERS, "L4_61_significant_clusters.png", LEGEND_FONTSIZE)
+print(f"Saved UMAP with {len(SIG_L4_CLUSTERS)} significant L4 clusters to {OUTDIR}/L4_61_significant_clusters.png")
